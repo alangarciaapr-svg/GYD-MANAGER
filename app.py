@@ -48,12 +48,14 @@ st.markdown("""
         border: 1px solid #e2e8f0;
         text-align: center;
         box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+        margin-bottom: 10px;
     }
-    .kpi-title { font-size: 0.85em; color: #64748b; font-weight: 600; text-transform: uppercase; margin-bottom: 5px; }
-    .kpi-value { font-size: 1.5em; font-weight: 700; color: #0f172a; }
-    .kpi-sub { font-size: 0.8em; color: #94a3b8; }
-    .profit-pos { color: #16a34a !important; }
-    .profit-neg { color: #dc2626 !important; }
+    .kpi-title { font-size: 0.9em; color: #64748b; font-weight: 700; text-transform: uppercase; margin-bottom: 10px; border-bottom: 1px solid #f1f5f9; padding-bottom: 5px;}
+    .kpi-row { display: flex; justify-content: space-between; margin-bottom: 5px; font-size: 0.95em;}
+    .kpi-label { color: #64748b; }
+    .kpi-val { font-weight: 600; color: #0f172a; }
+    .kpi-profit { color: #16a34a; font-weight: 700; font-size: 1.1em; }
+    .kpi-loss { color: #dc2626; font-weight: 700; font-size: 1.1em; }
     
     /* Ocultar índice de tablas */
     thead tr th:first-child {display:none}
@@ -61,7 +63,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-CONFIG_FILE = 'forest_config_v13_dash_time.json'
+CONFIG_FILE = 'forest_config_v14_dashboard_fix.json'
 
 # --- 2. FUNCIONES GLOBALES ---
 
@@ -254,7 +256,6 @@ final_h_mes = tot_h_dir + ind_h
 final_f_mes = tot_f_dir + ind_f
 cost_mensual_sistema = final_h_mes + final_f_mes
 
-# Horas Operativas del Sistema (Usamos el mayor para dimensionar capacidad)
 hrs_sistema_mes = max(hrs_h, hrs_f) if max(hrs_h, hrs_f) > 0 else 1
 
 # --- 6. INTERFAZ PRINCIPAL ---
@@ -266,32 +267,25 @@ tab_dash, tab_h, tab_f, tab_ind, tab_sim = st.tabs([
 
 # --- TAB 1: DASHBOARD GERENCIAL ---
 with tab_dash:
-    st.markdown("### 📊 Tablero de Rentabilidad Operacional")
+    st.subheader("Tablero de Resultados Operacionales")
     
     # 1. Inputs Producción
     c_in1, c_in2, c_in3 = st.columns(3)
     with c_in1:
-        st.markdown("**Producción Mensual (m³ Sólidos)**")
-        prod_h_m3 = st.number_input("Harvester (m³)", value=5000.0, step=100.0)
-        prod_f_m3 = st.number_input("Forwarder (m³)", value=5000.0, step=100.0)
-    
+        prod_h_m3 = st.number_input("Producción H (m³)", value=5000.0, step=100.0)
     with c_in2:
-        st.markdown("**Conversión a MR**")
+        prod_f_m3 = st.number_input("Producción F (m³)", value=5000.0, step=100.0)
+    with c_in3:
         prod_f_mr = prod_f_m3 / st.session_state['conv_factor']
         st.metric("Total Producción MR", f"{prod_f_mr:,.1f}", f"Factor: {st.session_state['conv_factor']}")
-        
-    with c_in3:
-        st.markdown("**Facturación**")
-        ingresos_mes = prod_f_mr * st.session_state['sales_price']
-        st.metric("Venta Neta Mes", fmt_money(ingresos_mes), "Base Producción Forwarder")
 
     st.divider()
 
-    # 2. CÁLCULOS TEMPORALES (HORA / SEMANA / MES)
+    # 2. CÁLCULOS TEMPORALES
+    ingresos_mes = prod_f_mr * st.session_state['sales_price']
     utilidad_mes = ingresos_mes - cost_mensual_sistema
-    margen_mes = (utilidad_mes / ingresos_mes * 100) if ingresos_mes > 0 else 0
     
-    # Supuestos Semanales (Mes / 4) y Horarios (Mes / Horas Sistema)
+    # Cálculos derivados
     ingreso_sem = ingresos_mes / 4
     costo_sem = cost_mensual_sistema / 4
     utilidad_sem = utilidad_mes / 4
@@ -300,60 +294,44 @@ with tab_dash:
     costo_hr = cost_mensual_sistema / hrs_sistema_mes
     utilidad_hr = utilidad_mes / hrs_sistema_mes
 
-    # 3. MATRIZ DE RENTABILIDAD
-    st.subheader("⏱️ Rentabilidad por Escala de Tiempo")
+    # 3. MATRIZ VISUAL DE RESULTADOS (Vs)
+    st.subheader("⏱️ Rentabilidad por Escala: Hora vs Semana vs Mes")
     
-    # Estilo de tarjeta personalizada
-    def kpi_card(title, val1, label1, val2, label2, val3, label3, is_profit=False):
-        color_class = "profit-pos" if is_profit and val3 > 0 else "profit-neg" if is_profit else ""
+    # Gráfico Comparativo
+    df_chart = pd.DataFrame({
+        "Periodo": ["Hora", "Hora", "Hora", "Semana", "Semana", "Semana", "Mes", "Mes", "Mes"],
+        "Tipo": ["Ingresos", "Costos", "Utilidad"] * 3,
+        "Monto": [ingreso_hr, costo_hr, utilidad_hr, ingreso_sem, costo_sem, utilidad_sem, ingresos_mes, cost_mensual_sistema, utilidad_mes]
+    })
+    
+    # Colores semaforizados
+    colors = {"Ingresos": "#3b82f6", "Costos": "#ef4444", "Utilidad": "#22c55e"}
+    
+    fig = px.bar(df_chart, x="Periodo", y="Monto", color="Tipo", barmode="group",
+                 color_discrete_map=colors, text_auto='.2s', title="Comparativa Ganancias vs Costos")
+    st.plotly_chart(fig, use_container_width=True)
+
+    # 4. TABLA DETALLADA
+    st.subheader("📋 Detalle Financiero")
+    
+    # Crear HTML cards para visualizar mejor
+    col1, col2, col3 = st.columns(3)
+    
+    def render_card(title, inc, cost, prof):
+        prof_class = "kpi-profit" if prof > 0 else "kpi-loss"
         return f"""
         <div class="kpi-card">
             <div class="kpi-title">{title}</div>
-            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; align-items: end;">
-                <div><div class="kpi-sub">{label1}</div><div class="kpi-value" style="font-size:1.1em">{fmt_money(val1)}</div></div>
-                <div><div class="kpi-sub">{label2}</div><div class="kpi-value" style="font-size:1.1em; color:#ef4444">{fmt_money(val2)}</div></div>
-                <div><div class="kpi-sub">{label3}</div><div class="kpi-value {color_class}" style="font-size:1.3em">{fmt_money(val3)}</div></div>
-            </div>
+            <div class="kpi-row"><span class="kpi-label">Ingresos</span><span class="kpi-val">{fmt_money(inc)}</span></div>
+            <div class="kpi-row"><span class="kpi-label">Costos</span><span class="kpi-val" style="color:#ef4444">{fmt_money(cost)}</span></div>
+            <hr style="margin: 5px 0; border-color: #f1f5f9;">
+            <div class="kpi-row"><span class="kpi-label" style="font-weight:700">UTILIDAD</span><span class="{prof_class}">{fmt_money(prof)}</span></div>
         </div>
         """
-
-    c_hr, c_sem, c_mes = st.columns(3)
-    
-    with c_hr:
-        st.markdown(kpi_card("Rentabilidad por HORA", ingreso_hr, "Ingreso", costo_hr, "Costo", utilidad_hr, "Utilidad", True), unsafe_allow_html=True)
-    with c_sem:
-        st.markdown(kpi_card("Rentabilidad SEMANAL (Prom)", ingreso_sem, "Ingreso", costo_sem, "Costo", utilidad_sem, "Utilidad", True), unsafe_allow_html=True)
-    with c_mes:
-        st.markdown(kpi_card("Rentabilidad MENSUAL", ingresos_mes, "Ingreso", cost_mensual_sistema, "Costo", utilidad_mes, "Utilidad", True), unsafe_allow_html=True)
-
-    st.write("")
-    
-    # 4. GRÁFICOS
-    c_graph_l, c_graph_r = st.columns([1, 2])
-    with c_graph_l:
-        # Velocímetro Margen
-        fig_gauge = go.Figure(go.Indicator(
-            mode = "gauge+number", value = margen_mes, title = {'text': "Margen % Mes"},
-            gauge = {'axis': {'range': [None, 60]}, 'bar': {'color': "#16a34a"},
-                     'steps': [{'range': [0, 10], 'color': '#fee2e2'}, {'range': [10, 30], 'color': '#fef9c3'}],
-                     'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 35}}
-        ))
-        fig_gauge.update_layout(height=300, margin=dict(l=20,r=20,t=30,b=20))
-        st.plotly_chart(fig_gauge, use_container_width=True)
         
-    with c_graph_r:
-        # Cascada
-        fig_water = go.Figure(go.Waterfall(
-            name = "Finanzas", orientation = "v",
-            measure = ["relative", "relative", "relative", "relative", "total"],
-            x = ["Ventas", "Costo Harvester", "Costo Forwarder", "Indirectos", "UTILIDAD"],
-            text = [fmt_money(ingresos_mes), fmt_money(-final_h_mes), fmt_money(-final_f_mes), fmt_money(-tot_ind), fmt_money(utilidad_mes)],
-            y = [ingresos_mes, -tot_h_dir, -tot_f_dir, -tot_ind, utilidad_mes],
-            connector = {"line":{"color":"rgb(63, 63, 63)"}},
-            decreasing = {"marker":{"color":"#ef4444"}}, increasing = {"marker":{"color":"#16a34a"}}, totals = {"marker":{"color":"#15803d"}}
-        ))
-        fig_water.update_layout(title="Estructura de Resultados Mensual", height=300, margin=dict(l=20,r=20,t=40,b=20))
-        st.plotly_chart(fig_water, use_container_width=True)
+    with col1: st.markdown(render_card("POR HORA", ingreso_hr, costo_hr, utilidad_hr), unsafe_allow_html=True)
+    with col2: st.markdown(render_card("POR SEMANA", ingreso_sem, costo_sem, utilidad_sem), unsafe_allow_html=True)
+    with col3: st.markdown(render_card("POR MES", ingresos_mes, cost_mensual_sistema, utilidad_mes), unsafe_allow_html=True)
 
 # --- TAB 2: HARVESTER ---
 with tab_h:
@@ -411,7 +389,7 @@ with tab_sim:
         prod_sim = st.number_input("Prod. Estimada (MR/Hr)", value=22.0, step=0.5)
         save_config()
 
-    # Cálculos de Costo Unitario
+    # Cálculos
     cost_h_hr_real = (tot_h_dir + ind_h) / hrs_h if hrs_h > 0 else 0
     cost_f_hr_real = (tot_f_dir + ind_f) / hrs_f if hrs_f > 0 else 0
     safe_prod = prod_sim if prod_sim > 0 else 1
@@ -420,30 +398,33 @@ with tab_sim:
     cost_unit_f = cost_f_hr_real / safe_prod
     cost_unit_sys = cost_unit_h + cost_unit_f
 
-    # Cálculo Tarifas
-    p_h_sim = calc_price(cost_unit_h, margin_h)
-    p_f_sim = calc_price(cost_unit_f, margin_f)
-    profit_h = p_h_sim - cost_unit_h
-    profit_f = p_f_sim - cost_unit_f
-
+    # Análisis Rango
     st.divider()
-    st.subheader(f"🎛️ Resultado Simulación Manual")
+    st.subheader("📊 Análisis de Rango Objetivo (30% - 35%)")
     
-    col_d1, col_d2, col_d3 = st.columns(3)
-    with col_d1:
-        st.markdown(f'<div class="highlight-box"><span class="label-text">Harvester</span><br><span class="big-number">{fmt_money(p_h_sim)}</span><br><span class="sub-text">Tarifa Sugerida / MR</span></div>', unsafe_allow_html=True)
-    with col_d2:
-        st.markdown(f'<div class="highlight-box"><span class="label-text">Forwarder</span><br><span class="big-number">{fmt_money(p_f_sim)}</span><br><span class="sub-text">Tarifa Sugerida / MR</span></div>', unsafe_allow_html=True)
-    with col_d3:
-        st.markdown(f'<div class="highlight-box" style="border-left-color: #1d4ed8;"><span class="label-text">TOTAL SISTEMA</span><br><span class="big-number" style="color:#1d4ed8;">{fmt_money(p_h_sim+p_f_sim)}</span><br><span class="sub-text">Tarifa / MR</span></div>', unsafe_allow_html=True)
+    p_h_30 = calc_price(costo_unit_h, 30)
+    p_f_30 = calc_price(costo_unit_f, 30)
+    p_sys_30 = p_h_30 + p_f_30
 
-    # Tabla Detalle
-    st.write("")
-    df_detail = pd.DataFrame({
-        "Concepto": ["Harvester", "Forwarder", "SISTEMA TOTAL"],
-        "Costo Unitario": [fmt_money(cost_unit_h), fmt_money(cost_unit_f), fmt_money(cost_unit_sys)],
-        "Utilidad Unit.": [fmt_money(profit_h), fmt_money(profit_f), fmt_money(profit_h + profit_f)],
-        "Tarifa Final": [fmt_money(p_h_sim), fmt_money(p_f_sim), fmt_money(p_h_sim + p_f_sim)],
-        "Margen %": [f"{margin_h}%", f"{margin_f}%", f"{((profit_h+profit_f)/(p_h_sim+p_f_sim)*100):.1f}%"]
-    })
-    st.dataframe(df_detail, use_container_width=True, hide_index=True)
+    p_h_35 = calc_price(costo_unit_h, 35)
+    p_f_35 = calc_price(costo_unit_f, 35)
+    p_sys_35 = p_h_35 + p_f_35
+
+    col_30, col_35 = st.columns(2)
+    with col_30:
+        st.markdown(f"""
+        <div class="highlight-box" style="border-left-color:#fcd34d; background-color:#fffbeb;">
+            <div style="color:#b45309; font-weight:bold">Escenario Base (30%)</div>
+            <div style="font-size:1.5em; font-weight:800; color:#b45309">{fmt_money(p_sys_30)} / MR</div>
+            <div style="font-size:0.9em; text-align:left; margin-top:10px">H: {fmt_money(p_h_30)} | F: {fmt_money(p_f_30)}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_35:
+        st.markdown(f"""
+        <div class="highlight-box" style="border-left-color:#86efac; background-color:#f0fdf4;">
+            <div style="color:#15803d; font-weight:bold">Escenario Ideal (35%)</div>
+            <div style="font-size:1.5em; font-weight:800; color:#15803d">{fmt_money(p_sys_35)} / MR</div>
+            <div style="font-size:0.9em; text-align:left; margin-top:10px">H: {fmt_money(p_h_35)} | F: {fmt_money(p_f_35)}</div>
+        </div>
+        """, unsafe_allow_html=True)
