@@ -1,575 +1,449 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-from datetime import datetime
-import os
-import shutil
-from fpdf import FPDF
-from io import BytesIO
-import matplotlib.pyplot as plt
-import matplotlib
-import tempfile
 import numpy as np
+import json
+import os
+import plotly.express as px
+import plotly.graph_objects as go
+import io
+import requests
 
-# Configuración Matplotlib
-matplotlib.use('Agg')
+# --- 1. CONFIGURACIÓN Y ESTILO CORPORATIVO ---
+st.set_page_config(
+    page_title="Forestal Costing Pro", 
+    layout="wide", 
+    page_icon="🌲",
+    initial_sidebar_state="expanded"
+)
 
-# --- 1. CONFIGURACIÓN ---
-st.set_page_config(page_title="SST - Maderas Galvez", layout="wide", page_icon="🌲")
-
-# --- 2. GESTIÓN DE DATOS ---
-CSV_FILE = "base_datos_galvez_v26.csv"
-LOGO_FILE = "logo_empresa_persistente.png"
-MESES_ORDEN = ['Enero','Febrero','Marzo','Abril','Mayo','Junio','Julio','Agosto','Septiembre','Octubre','Noviembre','Diciembre']
-
-# COLORES
-COLOR_PRIMARY = (183, 28, 28)
-COLOR_SECONDARY = (50, 50, 50)
-
-def get_structure_for_year(year):
-    data = []
-    for m in MESES_ORDEN:
-        data.append({
-            'Año': int(year), 'Mes': m,
-            # DATOS BASE
-            'Masa Laboral': 0.0, 'Horas Extras': 0.0, 'Horas Ausentismo': 0.0,
-            # ACCIDENTABILIDAD
-            'Accidentes CTP': 0.0, 'Accidentes Fatales': 0.0,
-            'Días Perdidos': 0.0, 'Días Cargo': 0.0,
-            # ENFERMEDADES PROFESIONALES
-            'Enf. Profesionales': 0.0, 'Días Perdidos EP': 0.0,
-            # SINIESTRALIDAD DS67
-            'Pensionados': 0.0, 'Indemnizados': 0.0,
-            # GESTIÓN
-            'Insp. Programadas': 0.0, 'Insp. Ejecutadas': 0.0,
-            'Cap. Programadas': 0.0, 'Cap. Ejecutadas': 0.0,
-            'Medidas Abiertas': 0.0, 'Medidas Cerradas': 0.0,
-            'Expuestos Silice/Ruido': 0.0, 'Vig. Salud Vigente': 0.0,
-            'Observaciones': "",
-            # CALCULADOS
-            'HHT': 0.0, 'Tasa Acc.': 0.0, 'Tasa Sin.': 0.0, 'Indice Frec.': 0.0, 'Indice Grav.': 0.0
-        })
-    return pd.DataFrame(data)
-
-def inicializar_db_completa():
-    df_24 = get_structure_for_year(2024)
-    df_25 = get_structure_for_year(2025)
-    df_26 = get_structure_for_year(2026)
-    return pd.concat([df_24, df_25, df_26], ignore_index=True)
-
-def procesar_datos(df, factor_base=210):
-    # Limpieza de tipos
-    cols_exclude = ['Año', 'Mes', 'Observaciones']
-    for col in df.columns:
-        if col not in cols_exclude:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    df['Año'] = df['Año'].fillna(2026).astype(int)
-    if 'Observaciones' not in df.columns: df['Observaciones'] = ""
-    df['Observaciones'] = df['Observaciones'].fillna("").astype(str)
-
-    # CÁLCULOS CRÍTICOS (HHT BASE 210)
-    # Fórmula Mutual: (Trabajadores * 210) + Extras - Ausentismo
-    df['HHT'] = (df['Masa Laboral'] * factor_base) + df['Horas Extras'] - df['Horas Ausentismo']
-    df['HHT'] = df['HHT'].apply(lambda x: x if x > 0 else 0)
-    
-    def calc_row(row):
-        masa = row['Masa Laboral']
-        hht = row['HHT']
-        if masa <= 0 or hht <= 0: return 0, 0, 0, 0
-        
-        ta = (row['Accidentes CTP'] / masa) * 100
-        ts = (row['Días Perdidos'] / masa) * 100 
-        if_ = (row['Accidentes CTP'] * 1000000) / hht
-        ig = ((row['Días Perdidos'] + row['Días Cargo']) * 1000000) / hht
-        return ta, ts, if_, ig
-
-    result = df.apply(calc_row, axis=1, result_type='expand')
-    df['Tasa Acc.'] = result[0]
-    df['Tasa Sin.'] = result[1]
-    df['Indice Frec.'] = result[2]
-    df['Indice Grav.'] = result[3]
-    return df
-
-def load_data():
-    if os.path.exists(CSV_FILE):
-        try:
-            df = pd.read_csv(CSV_FILE)
-            if df.empty: return inicializar_db_completa()
-            # Reparación estructura
-            ref_df = get_structure_for_year(2026)
-            for col in ref_df.columns:
-                if col not in df.columns:
-                    if col == 'Observaciones': df[col] = ""
-                    else: df[col] = 0.0
-            # Se procesa inicialmente con 210, luego la UI lo actualiza si cambia
-            return procesar_datos(df[ref_df.columns], 210)
-        except: return inicializar_db_completa()
-    return inicializar_db_completa()
-
-def save_data(df, factor_base):
-    df_calc = procesar_datos(df, factor_base)
-    if os.path.exists(CSV_FILE):
-        try: shutil.copy(CSV_FILE, f"{CSV_FILE}.bak")
-        except: pass
-    df_calc.to_csv(CSV_FILE, index=False)
-    return df_calc
-
-def generar_insight_automatico(row_mes, ta_acum, metas):
-    insights = []
-    if ta_acum > metas['meta_ta']:
-        insights.append(f"⚠️ <b>ALERTA:</b> Tasa Acumulada ({ta_acum:.2f}%) excede meta ({metas['meta_ta']}%)")
-    elif ta_acum > (metas['meta_ta'] * 0.8):
-        insights.append(f"🔸 <b>PRECAUCIÓN:</b> Tasa Acumulada al límite.")
-    else:
-        insights.append(f"✅ <b>EXCELENTE:</b> Accidentabilidad bajo control.")
-    
-    if row_mes['Tasa Sin.'] > 0:
-        insights.append(f"🚑 <b>DÍAS PERDIDOS:</b> {int(row_mes['Días Perdidos'])} días perdidos.")
-    
-    if not insights: return "Sin desviaciones."
-    return "<br>".join(insights)
-
-if 'df_main' not in st.session_state:
-    st.session_state['df_main'] = load_data()
-
-# --- 3. BARRA LATERAL ---
-with st.sidebar:
-    st.title("🌲 Panel de Control")
-    uploaded_logo = st.file_uploader("Actualizar Logo", type=['png', 'jpg'])
-    if uploaded_logo:
-        with open(LOGO_FILE, "wb") as f: f.write(uploaded_logo.getbuffer())
-        st.success("Logo actualizado."); st.rerun()
-    if os.path.exists(LOGO_FILE): st.image(LOGO_FILE, use_container_width=True)
-
-    st.markdown("---")
-    st.markdown("### ⚙️ Factor HHT (Mutual)")
-    
-    # FACTOR HHT CONFIGURABLE (Defecto 210)
-    factor_hht = st.number_input("Horas Base por Trabajador", value=210, 
-                                 help="Estándar Mutual: 210. Ley 40hrs: 160 aprox.")
-    
-    # Recalcular en tiempo real
-    if 'factor_hht_cache' not in st.session_state or st.session_state['factor_hht_cache'] != factor_hht:
-        st.session_state['df_main'] = procesar_datos(st.session_state['df_main'], factor_hht)
-        st.session_state['factor_hht_cache'] = factor_hht
-
-    st.markdown("---")
-    st.markdown("### 📅 Gestión de Años")
-    years_present = st.session_state['df_main']['Año'].unique()
-    c_y1, c_y2 = st.columns(2)
-    new_year_input = c_y1.number_input("Año", 2000, 2050, 2024)
-    if c_y2.button("Crear Año"):
-        if new_year_input in years_present: st.warning("Ya existe.")
-        else:
-            df_new = get_structure_for_year(new_year_input)
-            st.session_state['df_main'] = pd.concat([st.session_state['df_main'], df_new], ignore_index=True)
-            save_data(st.session_state['df_main'], factor_hht); st.rerun()
-
-    st.markdown("---")
-    def to_excel(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='SST_Data')
-        return output.getvalue()
-    
-    excel_data = to_excel(st.session_state['df_main'])
-    st.download_button("📊 Descargar Excel", data=excel_data, file_name="Base_SST_Completa.xlsx")
-
-    st.markdown("---")
-    meta_ta = st.slider("Meta Tasa Acc. (%)", 0.0, 8.0, 3.0)
-    meta_gestion = st.slider("Meta Gestión (%)", 50, 100, 90)
-    metas = {'meta_ta': meta_ta, 'meta_gestion': meta_gestion}
-
-# --- 4. MOTOR PDF EJECUTIVO ---
-class PDF_SST(FPDF):
-    def header(self):
-        self.set_fill_color(245, 245, 245)
-        self.rect(0, 0, 210, 40, 'F')
-        if os.path.exists(LOGO_FILE): self.image(LOGO_FILE, 10, 8, 35)
-        
-        self.set_xy(50, 10); self.set_font('Arial', 'B', 16); self.set_text_color(*COLOR_PRIMARY)
-        self.cell(0, 8, 'SOCIEDAD MADERERA GALVEZ Y DI GENOVA LTDA', 0, 1, 'L')
-        self.set_xy(50, 18); self.set_font('Arial', 'B', 11); self.set_text_color(*COLOR_SECONDARY)
-        self.cell(0, 6, 'INFORME EJECUTIVO DE GESTIÓN SST (DS 44)', 0, 1, 'L')
-        
-        self.set_draw_color(*COLOR_PRIMARY); self.set_line_width(1)
-        self.line(10, 38, 200, 38); self.ln(30)
-
-    def footer(self):
-        self.set_y(-15); self.set_font('Arial', 'I', 8); self.set_text_color(150)
-        self.cell(0, 10, f'Documento Oficial SGSST - Pagina {self.page_no()}', 0, 0, 'C')
-
-    def section_title(self, title):
-        self.set_font('Arial', 'B', 12); self.set_fill_color(*COLOR_SECONDARY); self.set_text_color(255, 255, 255)
-        self.cell(0, 8, f"  {title}", 0, 1, 'L', 1)
-        self.set_text_color(0, 0, 0); self.ln(4)
-
-    def draw_donut_chart_image(self, val_pct, color_hex, x, y, size=30):
-        try:
-            val_plot = min(val_pct, 100); val_plot = max(val_plot, 0)
-            fig, ax = plt.subplots(figsize=(2, 2))
-            ax.pie([val_plot, 100-val_plot], colors=[color_hex, '#eeeeee'], startangle=90, counterclock=False, 
-                   wedgeprops=dict(width=0.4, edgecolor='white'))
-            ax.text(0, 0, f"{val_pct:.0f}%", ha='center', va='center', fontsize=12, fontweight='bold', color='#333333')
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                plt.savefig(tmp.name, format='png', transparent=True, dpi=100, bbox_inches='tight')
-                tmp_name = tmp.name
-            plt.close(fig)
-            self.image(tmp_name, x=x, y=y, w=size, h=size)
-            os.unlink(tmp_name)
-        except: pass
-
-    def draw_kpi_circle_pair(self, title, val_m, val_a, max_scale, meta, unit, x, y):
-        try:
-            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(4, 2))
-            
-            color_m = '#4CAF50' if val_m <= meta else '#F44336' 
-            if "Gest" in title: color_m = '#4CAF50' if val_m >= meta else '#F44336'
-            val_m_plot = min(val_m, max_scale); rem_m = max_scale - val_m_plot
-            ax1.pie([val_m_plot, rem_m], colors=[color_m, '#EEEEEE'], startangle=90, counterclock=False, wedgeprops=dict(width=0.3, edgecolor='white'))
-            ax1.text(0, 0, f"{val_m:.1f}\n{unit}", ha='center', va='center', fontsize=10, fontweight='bold')
-            ax1.set_title("MENSUAL", fontsize=8, color='#555555')
-
-            color_a = '#4CAF50' if val_a <= meta else '#F44336'
-            if "Gest" in title: color_a = '#4CAF50' if val_a >= meta else '#F44336'
-            val_a_plot = min(val_a, max_scale); rem_a = max_scale - val_a_plot
-            ax2.pie([val_a_plot, rem_a], colors=[color_a, '#EEEEEE'], startangle=90, counterclock=False, wedgeprops=dict(width=0.3, edgecolor='white'))
-            ax2.text(0, 0, f"{val_a:.1f}\n{unit}", ha='center', va='center', fontsize=10, fontweight='bold')
-            ax2.set_title("ACUMULADO", fontsize=8, color='#555555')
-
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
-                plt.savefig(tmp.name, format='png', bbox_inches='tight', dpi=100)
-                tmp_name = tmp.name
-            plt.close(fig)
-            self.set_xy(x, y); self.set_font('Arial', 'B', 9)
-            self.cell(90, 8, title, 0, 1, 'C')
-            self.image(tmp_name, x=x+5, y=y+8, w=80, h=40)
-            os.unlink(tmp_name)
-        except: pass
-
-    def clean_text(self, text):
-        replacements = {'\u2013': '-', '\u2014': '-', '\u2018': "'", '\u2019': "'", '\u201c': '"', '\u201d': '"', '\u2022': '*', '€': 'EUR'}
-        for k, v in replacements.items(): text = text.replace(k, v)
-        return text.encode('latin-1', 'replace').decode('latin-1')
-
-    def footer_signatures(self):
-        y_pos = self.get_y() + 10
-        if y_pos > 250:
-            self.add_page(); y_pos = self.get_y() + 20
-        self.set_y(y_pos)
-        self.line(20, y_pos, 90, y_pos)
-        self.set_xy(20, y_pos + 2); self.set_font('Arial', 'B', 9); self.set_text_color(0,0,0)
-        self.cell(70, 5, "RODRIGO GALVEZ REBOLLEDO", 0, 1, 'C')
-        self.set_xy(20, y_pos + 7); self.set_font('Arial', '', 8)
-        self.cell(70, 5, "Gerente General / Rep. Legal", 0, 1, 'C')
-        self.line(120, y_pos, 190, y_pos)
-        self.set_xy(120, y_pos + 2); self.set_font('Arial', 'B', 9)
-        self.cell(70, 5, "ALAN GARCIA VIDAL", 0, 1, 'C')
-        self.set_xy(120, y_pos + 7); self.set_font('Arial', '', 8)
-        self.cell(70, 5, "Ingeniero en Prevención de Riesgos", 0, 1, 'C')
-        self.ln(15); self.set_font('Arial', 'I', 7); self.set_text_color(128)
-        self.multi_cell(0, 4, "Este documento es parte integrante del SGSST. Confidencial.", 0, 'C')
-
-    def draw_detailed_stats_table(self, data_list):
-        self.set_font('Arial', 'B', 9)
-        self.set_fill_color(230, 230, 230); self.set_text_color(0, 0, 0)
-        self.cell(100, 8, "INDICADOR (DS 67 / DS 40)", 1, 0, 'L', 1)
-        self.cell(45, 8, "MES ACTUAL", 1, 0, 'C', 1)
-        self.cell(45, 8, "ACUMULADO ANUAL", 1, 1, 'C', 1)
-        self.set_font('Arial', '', 9)
-        for label, val_m, val_a, is_bold in data_list:
-            if is_bold: self.set_font('Arial', 'B', 9)
-            else: self.set_font('Arial', '', 9)
-            self.ln()
-            self.cell(100, 7, f" {label}", 1, 0, 'L')
-            self.cell(45, 7, str(val_m), 1, 0, 'C')
-            self.cell(45, 7, str(val_a), 1, 1, 'C')
-
-# --- 5. DASHBOARD ---
-df = st.session_state['df_main']
-tab_dash, tab_editor = st.tabs(["📊 DASHBOARD EJECUTIVO", "📝 EDITOR DE DATOS"])
-
-years = sorted(df['Año'].unique(), reverse=True)
-if not years: years = [2026]
-
-with tab_dash:
-    c1, c2 = st.columns([1, 4])
-    with c1:
-        if os.path.exists(LOGO_FILE): st.image(LOGO_FILE, width=160)
-    with c2:
-        st.title("SOCIEDAD MADERERA GALVEZ Y DI GENOVA LTDA")
-        st.markdown(f"### 🛡️ CONTROL DE MANDO EJECUTIVO (Base HHT: {factor_hht})")
-
-    col_y, col_m = st.columns(2)
-    sel_year = col_y.selectbox("Año Fiscal", years)
-    
-    df_year = df[df['Año'] == sel_year].copy()
-    df_year['Mes_Idx'] = df_year['Mes'].apply(lambda x: MESES_ORDEN.index(x) if x in MESES_ORDEN else 99)
-    df_year = df_year.sort_values('Mes_Idx')
-    months_avail = df_year['Mes'].tolist()
-    
-    if not months_avail: st.warning("Sin datos."); st.stop()
-    sel_month = col_m.selectbox("Mes de Corte", months_avail, index=len(months_avail)-1 if months_avail else 0)
-    
-    # CÁLCULOS
-    row_mes = df_year[df_year['Mes'] == sel_month].iloc[0]
-    idx_corte = MESES_ORDEN.index(sel_month)
-    df_acum = df_year[df_year['Mes_Idx'] <= idx_corte]
-    
-    sum_acc = df_acum['Accidentes CTP'].sum()
-    sum_fatales = df_acum['Accidentes Fatales'].sum()
-    sum_ep = df_acum['Enf. Profesionales'].sum()
-    sum_dias_acc = df_acum['Días Perdidos'].sum()
-    sum_dias_ep = df_acum['Días Perdidos EP'].sum()
-    sum_pensionados = df_acum['Pensionados'].sum()
-    sum_indemnizados = df_acum['Indemnizados'].sum()
-    sum_hht = df_acum['HHT'].sum()
-    
-    df_masa_ok = df_acum[df_acum['Masa Laboral'] > 0]
-    avg_masa = df_masa_ok['Masa Laboral'].mean() if not df_masa_ok.empty else 0
-
-    ta_acum = (sum_acc / avg_masa * 100) if avg_masa > 0 else 0
-    ts_acum = (sum_dias_acc / avg_masa * 100) if avg_masa > 0 else 0 
-    if_acum = (sum_acc * 1000000 / sum_hht) if sum_hht > 0 else 0
-    sum_dias_cargo = df_acum['Días Cargo'].sum()
-    ig_acum = ((sum_dias_acc + sum_dias_cargo) * 1000000 / sum_hht) if sum_hht > 0 else 0
-    
-    def safe_div(a, b): return (a/b*100) if b > 0 else 0
-    p_insp = safe_div(row_mes['Insp. Ejecutadas'], row_mes['Insp. Programadas'])
-    p_cap = safe_div(row_mes['Cap. Ejecutadas'], row_mes['Cap. Programadas'])
-    p_medidas = safe_div(row_mes['Medidas Cerradas'], row_mes['Medidas Abiertas']) if row_mes['Medidas Abiertas']>0 else 100
-    p_salud = safe_div(row_mes['Vig. Salud Vigente'], row_mes['Expuestos Silice/Ruido']) if row_mes['Expuestos Silice/Ruido']>0 else 100
-
-    insight_text = generar_insight_automatico(row_mes, ta_acum, metas)
-    st.info("💡 **ANÁLISIS INTELIGENTE DEL SISTEMA:**")
-    st.markdown(f"<div style='background-color:#e3f2fd; padding:10px; border-radius:5px;'>{insight_text}</div>", unsafe_allow_html=True)
-    
-    col_g1, col_g2, col_g3, col_g4 = st.columns(4)
-    def plot_gauge(value, title, max_val, threshold, inverse=False):
-        colors = {'good': '#2E7D32', 'bad': '#C62828'}
-        bar_color = colors['good'] if (value <= threshold if inverse else value >= threshold) else colors['bad']
-        fig = go.Figure(go.Indicator(mode = "gauge+number", value = value, title = {'text': title, 'font': {'size': 14}},
-            gauge = {'axis': {'range': [0, max_val]}, 'bar': {'color': bar_color}}))
-        fig.update_layout(height=200, margin=dict(t=30,b=10,l=20,r=20))
-        return fig
-
-    with col_g1: st.plotly_chart(plot_gauge(ta_acum, "Tasa Acc. Acum", 8, metas['meta_ta'], True), use_container_width=True)
-    with col_g2: st.plotly_chart(plot_gauge(ts_acum, "Tasa Sin. Acum", 50, 10, True), use_container_width=True)
-    with col_g3: st.plotly_chart(plot_gauge(if_acum, "Ind. Frec. Acum", 50, 10, True), use_container_width=True)
-    
-    with col_g4:
-        st.markdown("<br>", unsafe_allow_html=True)
-        st.metric("Total HHT (Año)", f"{int(sum_hht):,}".replace(",", "."))
-        st.caption(f"Calculado con Factor {factor_hht}")
-
-    st.markdown("---")
-    st.markdown("#### 📋 LISTADO MAESTRO DE INDICADORES (DS67)")
-    
-    stats_data = {
-        'Indicador': [
-            'Nº de Accidentes CTP', 'Nº de Enfermedades Profesionales', 
-            'Días Perdidos (Acc. Trabajo)', 'Días Perdidos (Enf. Prof.)', 
-            'Promedio de Trabajadores', 'Nº de Accidentes Fatales', 
-            'Nº de Pensionados', 'Nº de Indemnizados', 
-            'Tasa Siniestralidad (Inc. Temporal)', 'Dias Cargo (Factor Inv/Muerte)',
-            'Tasa de Accidentabilidad', 'Tasa de Frecuencia', 
-            'Tasa de Gravedad', 'Horas Hombre (HHT)'
-        ],
-        'Mes Actual': [
-            int(row_mes['Accidentes CTP']), int(row_mes['Enf. Profesionales']),
-            int(row_mes['Días Perdidos']), int(row_mes['Días Perdidos EP']),
-            f"{row_mes['Masa Laboral']:.1f}", int(row_mes['Accidentes Fatales']),
-            int(row_mes['Pensionados']), int(row_mes['Indemnizados']),
-            f"{row_mes['Tasa Sin.']:.2f}", int(row_mes['Días Cargo']),
-            f"{row_mes['Tasa Acc.']:.2f}%", f"{row_mes['Indice Frec.']:.2f}",
-            f"{row_mes['Indice Grav.']:.0f}", int(row_mes['HHT'])
-        ],
-        'Acumulado Anual': [
-            int(sum_acc), int(sum_ep),
-            int(sum_dias_acc), int(sum_dias_ep),
-            f"{avg_masa:.1f}", int(sum_fatales),
-            int(sum_pensionados), int(sum_indemnizados),
-            f"{ts_acum:.2f}", int(sum_dias_cargo),
-            f"{ta_acum:.2f}%", f"{if_acum:.2f}",
-            f"{ig_acum:.0f}", int(sum_hht)
-        ]
+# CSS Profesional
+st.markdown("""
+<style>
+    .main {background-color: #f8fafc;}
+    h1, h2, h3 {color: #0f172a; font-family: 'Segoe UI', sans-serif;}
+    .stMetric {
+        background-color: white;
+        border: 1px solid #e2e8f0;
+        border-radius: 8px;
+        padding: 15px;
+        box-shadow: 0 1px 2px rgba(0,0,0,0.05);
     }
-    st.table(pd.DataFrame(stats_data))
-
-    st.markdown("---")
-    g1, g2, g3, g4 = st.columns(4)
-    def donut(val, title, col_obj):
-        color = "#66BB6A" if val >= metas['meta_gestion'] else "#EF5350"
-        fig = go.Figure(go.Pie(values=[val, 100-val], hole=0.7, marker_colors=[color, '#eee'], textinfo='none'))
-        fig.update_layout(height=140, margin=dict(t=0,b=0,l=0,r=0), annotations=[dict(text=f"{val:.0f}%", x=0.5, y=0.5, font_size=20, showarrow=False)])
-        col_obj.markdown(f"<div style='text-align:center; font-size:13px;'>{title}</div>", unsafe_allow_html=True)
-        col_obj.plotly_chart(fig, use_container_width=True, key=title)
-
-    donut(p_insp, "Inspecciones", g1)
-    donut(p_cap, "Capacitaciones", g2)
-    donut(p_medidas, "Cierre Hallazgos", g3)
-    donut(p_salud, "Salud Ocupacional", g4)
-
-    st.markdown("---")
-    if st.button("📄 Generar Reporte Ejecutivo PDF"):
-        try:
-            pdf = PDF_SST(orientation='P', format='A4')
-            pdf.add_page(); pdf.set_font('Arial', 'B', 12)
-            pdf.cell(0, 10, f"PERIODO: {sel_month.upper()} {sel_year}", 0, 1, 'R')
-            
-            pdf.section_title("1. INDICADORES VISUALES (MES vs ACUMULADO)")
-            y_start = pdf.get_y()
-            pdf.draw_kpi_circle_pair("TASA ACCIDENTABILIDAD", row_mes['Tasa Acc.'], ta_acum, 8, metas['meta_ta'], "%", 10, y_start)
-            pdf.draw_kpi_circle_pair("TASA SINIESTRALIDAD", row_mes['Tasa Sin.'], ts_acum, 50, 10, "Dias", 110, y_start)
-            y_start += 55
-            pdf.draw_kpi_circle_pair("TASA FRECUENCIA", row_mes['Indice Frec.'], if_acum, 50, 10, "IF", 10, y_start)
-            pdf.draw_kpi_circle_pair("TASA GRAVEDAD", row_mes['Indice Grav.'], ig_acum, 200, 50, "IG", 110, y_start)
-            pdf.set_y(y_start + 60)
-            
-            pdf.section_title("2. ESTADÍSTICA DE SINIESTRALIDAD (DS 67)")
-            pdf.ln(2)
-            table_rows = [
-                ("Nro de Accidentes CTP", int(row_mes['Accidentes CTP']), int(sum_acc), False),
-                ("Nro de Enfermedades Profesionales", int(row_mes['Enf. Profesionales']), int(sum_ep), False),
-                ("Dias Perdidos (Acc. Trabajo)", int(row_mes['Días Perdidos']), int(sum_dias_acc), False),
-                ("Dias Perdidos (Enf. Profesional)", int(row_mes['Días Perdidos EP']), int(sum_dias_ep), False),
-                ("Promedio de Trabajadores", f"{row_mes['Masa Laboral']:.1f}", f"{avg_masa:.1f}", False),
-                ("Nro Accidentes Fatales", int(row_mes['Accidentes Fatales']), int(sum_fatales), False),
-                ("Nro Pensionados (Invalidez)", int(row_mes['Pensionados']), int(sum_pensionados), False),
-                ("Nro Indemnizados", int(row_mes['Indemnizados']), int(sum_indemnizados), False),
-                ("Tasa Siniestralidad (Inc. Temporal)", f"{row_mes['Tasa Sin.']:.2f}", f"{ts_acum:.2f}", False),
-                ("Dias Cargo (Inv. y Muerte)", int(row_mes['Días Cargo']), int(sum_dias_cargo), False), 
-                ("Tasa de Accidentabilidad (%)", f"{row_mes['Tasa Acc.']:.2f}", f"{ta_acum:.2f}", True),
-                ("Tasa de Frecuencia", f"{row_mes['Indice Frec.']:.2f}", f"{if_acum:.2f}", True),
-                ("Tasa de Gravedad", f"{row_mes['Indice Grav.']:.0f}", f"{ig_acum:.0f}", True),
-                ("Horas Hombre (HHT)", int(row_mes['HHT']), int(sum_hht), False)
-            ]
-            pdf.draw_detailed_stats_table(table_rows)
-            
-            pdf.add_page()
-            pdf.section_title("3. CUMPLIMIENTO PROGRAMA GESTIÓN")
-            insp_txt = f"{int(row_mes['Insp. Ejecutadas'])} de {int(row_mes['Insp. Programadas'])}"
-            cap_txt = f"{int(row_mes['Cap. Ejecutadas'])} de {int(row_mes['Cap. Programadas'])}"
-            med_txt = f"{int(row_mes['Medidas Cerradas'])} de {int(row_mes['Medidas Abiertas'])}"
-            salud_txt = f"{int(row_mes['Vig. Salud Vigente'])} de {int(row_mes['Expuestos Silice/Ruido'])}"
-            
-            data_gest = [("Inspecciones", p_insp, insp_txt), ("Capacitaciones", p_cap, cap_txt),
-                         ("Hallazgos", p_medidas, med_txt), ("Salud Ocup.", p_salud, salud_txt)]
-            
-            y_circles = pdf.get_y()
-            for i, (label, val, txt) in enumerate(data_gest):
-                x_pos = 15 + (i * 48)
-                color_hex = '#4CAF50' if val >= metas['meta_gestion'] else '#F44336'
-                pdf.draw_donut_chart_image(val, color_hex, x_pos, y_circles, size=30)
-                pdf.set_text_color(0,0,0)
-                pdf.set_xy(x_pos - 5, y_circles + 32); pdf.set_font('Arial', 'B', 8); pdf.cell(40, 4, label, 0, 1, 'C')
-                pdf.set_xy(x_pos - 5, y_circles + 36); pdf.set_font('Arial', '', 7); pdf.set_text_color(100); pdf.cell(40, 4, txt, 0, 1, 'C'); pdf.set_text_color(0)
-
-            pdf.set_y(y_circles + 45)
-            pdf.section_title("4. OBSERVACIONES DEL EXPERTO")
-            pdf.set_font('Arial', '', 10); pdf.set_text_color(0,0,0)
-            clean_insight = pdf.clean_text(insight_text.replace("<b>","").replace("</b>","").replace("<br>","\n").replace("⚠️","").replace("✅","").replace("🚑",""))
-            obs_raw = str(row_mes['Observaciones'])
-            if obs_raw.lower() in ["nan", "none", "0", "0.0", ""]: obs_raw = "Sin observaciones registradas."
-            clean_obs = pdf.clean_text(obs_raw)
-            pdf.multi_cell(0, 6, f"ANALISIS SISTEMA:\n{clean_insight}\n\nCOMENTARIOS EXPERTO:\n{clean_obs}", 1, 'L')
-            
-            pdf.ln(20); pdf.footer_signatures()
-            
-            out = pdf.output(dest='S').encode('latin-1')
-            st.download_button("📥 Descargar Reporte Ejecutivo", out, f"Reporte_SST_{sel_month}.pdf", "application/pdf")
-        except Exception as e: st.error(f"Error PDF: {e}")
-
-with tab_editor:
-    st.subheader("📝 Carga de Datos")
-    c_y, c_m = st.columns(2)
-    edit_year = c_y.selectbox("Año:", years, key="ed_y")
-    m_list = df[df['Año'] == edit_year]['Mes'].tolist()
-    m_list.sort(key=lambda x: MESES_ORDEN.index(x) if x in MESES_ORDEN else 99)
-    edit_month = c_m.selectbox("Mes:", m_list, key="ed_m")
+    div[data-testid="stExpander"] {
+        background-color: white;
+        border-radius: 8px;
+        border: 1px solid #e2e8f0;
+    }
+    .highlight-box {
+        background-color: #ffffff;
+        padding: 20px;
+        border-radius: 12px;
+        border-left: 6px solid #16a34a;
+        box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        text-align: center;
+    }
+    .kpi-card {
+        background-color: white;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #e2e8f0;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+    }
+    .kpi-title { font-size: 0.85em; color: #64748b; font-weight: 600; text-transform: uppercase; margin-bottom: 5px; }
+    .kpi-value { font-size: 1.5em; font-weight: 700; color: #0f172a; }
+    .kpi-sub { font-size: 0.8em; color: #94a3b8; }
+    .profit-pos { color: #16a34a !important; }
+    .profit-neg { color: #dc2626 !important; }
     
+    /* Ocultar índice de tablas */
+    thead tr th:first-child {display:none}
+    tbody th {display:none}
+</style>
+""", unsafe_allow_html=True)
+
+CONFIG_FILE = 'forest_config_v13_dash_time.json'
+
+# --- 2. FUNCIONES GLOBALES ---
+
+def fmt_money(x): 
+    """Formatea números como moneda CLP"""
+    if x is None: return "$ 0"
+    return f"$ {x:,.0f}".replace(",", ".")
+
+def calc_price(cost, margin_pct):
+    if margin_pct >= 100: return 0 
+    factor = 1 - (margin_pct / 100.0)
+    return cost / factor if factor > 0 else 0
+
+def calculate_system_costs(h_df, f_df, rrhh_df, flota_df, days_h, hrs_h, days_f, hrs_f, uf, diesel):
+    # Pre-procesamiento
+    h_df = h_df.fillna(0)
+    f_df = f_df.fillna(0)
+    rrhh_df = rrhh_df.fillna(0)
+    flota_df = flota_df.fillna(0)
+
+    # 1. Harvester
+    total_h = 0
+    total_h_hrs = days_h * hrs_h
+    for _, row in h_df.iterrows():
+        val = float(row.get('Valor', 0))
+        tipo = row.get('Tipo', '$/Mes')
+        frec = float(row.get('Frec', 1))
+        
+        cost = 0
+        if tipo == '$/Mes': cost = val
+        elif tipo == 'UF/Mes': cost = val * uf
+        elif tipo == 'Litros/Día': cost = val * days_h * diesel
+        elif tipo == '$/Ev': 
+            if frec > 0 and total_h_hrs > 0: 
+                cost = (val / frec) * total_h_hrs
+        total_h += cost
+
+    # 2. Forwarder
+    total_f = 0
+    total_f_hrs = days_f * hrs_f
+    for _, row in f_df.iterrows():
+        val = float(row.get('Valor', 0))
+        tipo = row.get('Unidad', '$/Mes')
+        
+        cost = 0
+        if tipo == '$/Mes': cost = val
+        elif tipo == 'Litros/Día': cost = val * days_f * diesel
+        total_f += cost
+
+    # 3. Indirectos
+    total_indirect = rrhh_df['Costo Empresa'].sum() + flota_df['Monto'].sum()
+
+    return total_h, total_f, total_indirect, total_h_hrs, total_f_hrs
+
+@st.cache_data(ttl=3600) 
+def get_uf_api():
     try:
-        row_idx = df.index[(df['Año'] == edit_year) & (df['Mes'] == edit_month)].tolist()[0]
-        with st.form("edit_form"):
-            st.info(f"Editando: **{edit_month} {edit_year}**")
-            
-            st.markdown("##### 🏭 Datos Base")
-            c1, c2, c3 = st.columns(3)
-            val_masa = c1.number_input("Nº Trabajadores", value=float(df.at[row_idx, 'Masa Laboral']))
-            val_extras = c2.number_input("Horas Extras", value=float(df.at[row_idx, 'Horas Extras']))
-            val_aus = c3.number_input("Horas Ausentismo", value=float(df.at[row_idx, 'Horas Ausentismo']))
-            
-            # SHOW HHT PREVIEW
-            hht_prev = (val_masa * factor_hht) + val_extras - val_aus
-            st.caption(f"HHT Estimadas (Factor {factor_hht}): {hht_prev:,.0f}")
+        url = "https://mindicador.cl/api/uf"
+        response = requests.get(url, timeout=2)
+        if response.status_code == 200:
+            data = response.json()
+            return data['serie'][0]['valor'], data['serie'][0]['fecha'][:10]
+    except:
+        return None, None
+    return None, None
 
-            st.markdown("##### 🚑 Siniestralidad")
-            c6, c7, c8 = st.columns(3)
-            val_acc = c6.number_input("Nº Accidentes CTP", value=float(df.at[row_idx, 'Accidentes CTP']))
-            val_dias = c7.number_input("Días Perdidos (Acc)", value=float(df.at[row_idx, 'Días Perdidos']))
-            val_fatales = c8.number_input("Nº Accidentes Fatales", value=float(df.at[row_idx, 'Accidentes Fatales']))
-            
-            c9, c10, c11 = st.columns(3)
-            val_ep = c9.number_input("Nº Enf. Profesionales", value=float(df.at[row_idx, 'Enf. Profesionales']))
-            val_dias_ep = c10.number_input("Días Perdidos (EP)", value=float(df.at[row_idx, 'Días Perdidos EP']))
-            val_cargo = c11.number_input("Días Cargo (Inv/Muerte)", value=float(df.at[row_idx, 'Días Cargo']))
-            
-            c12, c13 = st.columns(2)
-            val_pen = c12.number_input("Nº Pensionados", value=float(df.at[row_idx, 'Pensionados']))
-            val_ind = c13.number_input("Nº Indemnizados", value=float(df.at[row_idx, 'Indemnizados']))
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, (np.int_, np.intc, np.int64)): return int(obj)
+        elif isinstance(obj, (np.float_, np.float64)): return float(obj)
+        return json.JSONEncoder.default(self, obj)
 
-            st.markdown("##### 📋 Gestión")
-            c14, c15 = st.columns(2)
-            val_insp_p = c14.number_input("Insp. Programadas", value=float(df.at[row_idx, 'Insp. Programadas']))
-            val_insp_e = c15.number_input("Insp. Ejecutadas", value=float(df.at[row_idx, 'Insp. Ejecutadas']))
-            
-            c16, c17 = st.columns(2)
-            val_cap_p = c16.number_input("Cap. Programadas", value=float(df.at[row_idx, 'Cap. Programadas']))
-            val_cap_e = c17.number_input("Cap. Ejecutadas", value=float(df.at[row_idx, 'Cap. Ejecutadas']))
-            
-            c18, c19 = st.columns(2)
-            val_med_ab = c18.number_input("Hallazgos Abiertos", value=float(df.at[row_idx, 'Medidas Abiertas']))
-            val_med_ce = c19.number_input("Hallazgos Cerrados", value=float(df.at[row_idx, 'Medidas Cerradas']))
-            
-            c20, c21 = st.columns(2)
-            val_exp = c20.number_input("Expuestos (Silice/Ruido)", value=float(df.at[row_idx, 'Expuestos Silice/Ruido']))
-            val_vig = c21.number_input("Vigilancia Salud Vigente", value=float(df.at[row_idx, 'Vig. Salud Vigente']))
+def load_config():
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, 'r') as f: return json.load(f)
+        except: return {}
+    return {}
 
-            st.markdown("##### 📝 Observaciones")
-            c_obs = str(df.at[row_idx, 'Observaciones'])
-            if c_obs.lower() in ["nan", "none", "0", ""]: c_obs = ""
-            val_obs = st.text_area("Texto del Reporte:", value=c_obs, height=100)
-
-            if st.form_submit_button("💾 GUARDAR DATOS"):
-                # Guardar Base
-                df.at[row_idx, 'Masa Laboral'] = val_masa
-                df.at[row_idx, 'Horas Extras'] = val_extras
-                df.at[row_idx, 'Horas Ausentismo'] = val_aus
-                # Acc
-                df.at[row_idx, 'Accidentes CTP'] = val_acc
-                df.at[row_idx, 'Días Perdidos'] = val_dias
-                df.at[row_idx, 'Accidentes Fatales'] = val_fatales
-                df.at[row_idx, 'Días Cargo'] = val_cargo
-                # EP
-                df.at[row_idx, 'Enf. Profesionales'] = val_ep
-                df.at[row_idx, 'Días Perdidos EP'] = val_dias_ep
-                # DS67
-                df.at[row_idx, 'Pensionados'] = val_pen
-                df.at[row_idx, 'Indemnizados'] = val_ind
-                # Gestion
-                df.at[row_idx, 'Insp. Programadas'] = val_insp_p
-                df.at[row_idx, 'Insp. Ejecutadas'] = val_insp_e
-                df.at[row_idx, 'Cap. Programadas'] = val_cap_p
-                df.at[row_idx, 'Cap. Ejecutadas'] = val_cap_e
-                df.at[row_idx, 'Medidas Abiertas'] = val_med_ab
-                df.at[row_idx, 'Medidas Cerradas'] = val_med_ce
-                df.at[row_idx, 'Expuestos Silice/Ruido'] = val_exp
-                df.at[row_idx, 'Vig. Salud Vigente'] = val_vig
-                df.at[row_idx, 'Observaciones'] = val_obs
+def save_config():
+    keys = ["uf_manual", "fuel_price", "h_days", "h_hours", "f_days", "f_hours", 
+            "df_harvester", "df_forwarder", "df_rrhh", "df_flota", 
+            "alloc_pct", "sales_price", "target_margin_h", "target_margin_f", "conv_factor"]
+    
+    state_to_save = {}
+    for k in keys:
+        if k in st.session_state:
+            val = st.session_state[k]
+            if isinstance(val, pd.DataFrame): state_to_save[k] = val.to_dict('records')
+            else: state_to_save[k] = val
                 
-                st.session_state['df_main'] = save_data(df, factor_hht)
-                st.success("Guardado.")
-                st.rerun()
-    except Exception as e:
-        st.error(f"Error al cargar registro: {e}")
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(state_to_save, f, cls=NumpyEncoder)
+
+# --- 3. INICIALIZACIÓN ---
+saved = load_config()
+
+def init_key(key, default_value):
+    if key not in st.session_state:
+        loaded_val = saved.get(key)
+        if loaded_val is not None:
+            if isinstance(default_value, pd.DataFrame):
+                st.session_state[key] = pd.DataFrame(loaded_val)
+            else:
+                st.session_state[key] = loaded_val
+        else:
+            st.session_state[key] = default_value
+
+init_key('uf_manual', 39755.0)
+init_key('fuel_price', 774.0)
+init_key('sales_price', 11500.0)
+init_key('alloc_pct', 0.5)
+init_key('target_margin_h', 35.0)
+init_key('target_margin_f', 35.0)
+init_key('conv_factor', 2.44)
+init_key('h_days', 28)
+init_key('h_hours', 10.0)
+init_key('f_days', 28)
+init_key('f_hours', 10.0)
+
+# DataFrames
+init_key('df_harvester', pd.DataFrame([
+    {"Cat": "Fijos", "Ítem": "Arriendo Base", "Tipo": "$/Mes", "Frec": 1, "Valor": 10900000},
+    {"Cat": "Fijos", "Ítem": "Operador T1", "Tipo": "$/Mes", "Frec": 1, "Valor": 1923721},
+    {"Cat": "Variable", "Ítem": "Petróleo T1", "Tipo": "Litros/Día", "Frec": 1, "Valor": 200.0},
+    {"Cat": "Mantención", "Ítem": "Mant. 600h", "Tipo": "$/Ev", "Frec": 600, "Valor": 350000},
+]))
+
+init_key('df_forwarder', pd.DataFrame([
+    {"Cat": "Operación", "Ítem": "Arriendo", "Unidad": "$/Mes", "Valor": 8000000},
+    {"Cat": "Operación", "Ítem": "Operador", "Unidad": "$/Mes", "Valor": 1900000},
+    {"Cat": "Variable", "Ítem": "Petróleo", "Unidad": "Litros/Día", "Valor": 135.0},
+]))
+
+init_key('df_rrhh', pd.DataFrame([
+    {"Cargo": "Jefe de Faena", "Sueldo Líquido": 1800000, "Costo Empresa": 2300000},
+    {"Cargo": "Mecánico", "Sueldo Líquido": 1200000, "Costo Empresa": 1600000},
+]))
+
+init_key('df_flota', pd.DataFrame([
+    {"Ítem": "Camionetas (Arriendo)", "Monto": 1600000},
+    {"Ítem": "Combustible Apoyo", "Monto": 600000},
+]))
+
+# --- 4. SIDEBAR ---
+with st.sidebar:
+    st.markdown("## ⚙️ Panel de Control")
+    if st.button("♻️ Resetear App", type="secondary"):
+        if os.path.exists(CONFIG_FILE): os.remove(CONFIG_FILE)
+        st.session_state.clear()
+        st.rerun()
+
+    with st.expander("💰 Mercado y Tarifas", expanded=True):
+        use_api = st.checkbox("UF Automática", value=True)
+        uf_api_val, _ = get_uf_api()
+        val_uf_display = uf_api_val if (use_api and uf_api_val) else st.session_state['uf_manual']
+        
+        curr_uf = st.number_input("Valor UF ($)", value=float(val_uf_display), disabled=(use_api and uf_api_val is not None))
+        if curr_uf != st.session_state['uf_manual']:
+            st.session_state['uf_manual'] = curr_uf
+            save_config()
+
+        curr_fuel = st.number_input("Diesel ($/Lt)", value=float(st.session_state['fuel_price']), on_change=save_config, key="fuel_price")
+        curr_sales = st.number_input("Tarifa Venta ($/MR)", value=float(st.session_state['sales_price']), on_change=save_config, key="sales_price")
+
+    with st.expander("📏 Conversión Volumen"):
+        curr_factor = st.number_input("Factor (m³/MR)", value=float(st.session_state.get('conv_factor', 2.44)), step=0.01, key="conv_factor_input")
+        if curr_factor != st.session_state['conv_factor']:
+            st.session_state['conv_factor'] = curr_factor
+            save_config()
+
+    with st.expander("⚖️ Distribución Indirectos"):
+        alloc = st.slider("% Carga a Harvester", 0, 100, int(st.session_state['alloc_pct']*100)) / 100.0
+        if alloc != st.session_state['alloc_pct']:
+            st.session_state['alloc_pct'] = alloc
+            save_config()
+
+# --- 5. CÁLCULOS DEL SISTEMA ---
+tot_h_dir, tot_f_dir, tot_ind, hrs_h, hrs_f = calculate_system_costs(
+    st.session_state['df_harvester'], st.session_state['df_forwarder'], 
+    st.session_state['df_rrhh'], st.session_state['df_flota'],
+    int(st.session_state['h_days']), float(st.session_state['h_hours']), 
+    int(st.session_state['f_days']), float(st.session_state['f_hours']), 
+    curr_uf, curr_fuel
+)
+
+ind_h = tot_ind * st.session_state['alloc_pct']
+ind_f = tot_ind * (1 - st.session_state['alloc_pct'])
+final_h_mes = tot_h_dir + ind_h
+final_f_mes = tot_f_dir + ind_f
+cost_mensual_sistema = final_h_mes + final_f_mes
+
+# Horas Operativas del Sistema (Usamos el mayor para dimensionar capacidad)
+hrs_sistema_mes = max(hrs_h, hrs_f) if max(hrs_h, hrs_f) > 0 else 1
+
+# --- 6. INTERFAZ PRINCIPAL ---
+st.title("🌲 Sistema de Costos Forestales Profesional")
+
+tab_dash, tab_h, tab_f, tab_ind, tab_sim = st.tabs([
+    "📊 Dashboard Gerencial", "🚜 Harvester", "🚜 Forwarder", "👷 Indirectos", "📈 Simulador de Tarifas"
+])
+
+# --- TAB 1: DASHBOARD GERENCIAL ---
+with tab_dash:
+    st.markdown("### 📊 Tablero de Rentabilidad Operacional")
+    
+    # 1. Inputs Producción
+    c_in1, c_in2, c_in3 = st.columns(3)
+    with c_in1:
+        st.markdown("**Producción Mensual (m³ Sólidos)**")
+        prod_h_m3 = st.number_input("Harvester (m³)", value=5000.0, step=100.0)
+        prod_f_m3 = st.number_input("Forwarder (m³)", value=5000.0, step=100.0)
+    
+    with c_in2:
+        st.markdown("**Conversión a MR**")
+        prod_f_mr = prod_f_m3 / st.session_state['conv_factor']
+        st.metric("Total Producción MR", f"{prod_f_mr:,.1f}", f"Factor: {st.session_state['conv_factor']}")
+        
+    with c_in3:
+        st.markdown("**Facturación**")
+        ingresos_mes = prod_f_mr * st.session_state['sales_price']
+        st.metric("Venta Neta Mes", fmt_money(ingresos_mes), "Base Producción Forwarder")
+
+    st.divider()
+
+    # 2. CÁLCULOS TEMPORALES (HORA / SEMANA / MES)
+    utilidad_mes = ingresos_mes - cost_mensual_sistema
+    margen_mes = (utilidad_mes / ingresos_mes * 100) if ingresos_mes > 0 else 0
+    
+    # Supuestos Semanales (Mes / 4) y Horarios (Mes / Horas Sistema)
+    ingreso_sem = ingresos_mes / 4
+    costo_sem = cost_mensual_sistema / 4
+    utilidad_sem = utilidad_mes / 4
+    
+    ingreso_hr = ingresos_mes / hrs_sistema_mes
+    costo_hr = cost_mensual_sistema / hrs_sistema_mes
+    utilidad_hr = utilidad_mes / hrs_sistema_mes
+
+    # 3. MATRIZ DE RENTABILIDAD
+    st.subheader("⏱️ Rentabilidad por Escala de Tiempo")
+    
+    # Estilo de tarjeta personalizada
+    def kpi_card(title, val1, label1, val2, label2, val3, label3, is_profit=False):
+        color_class = "profit-pos" if is_profit and val3 > 0 else "profit-neg" if is_profit else ""
+        return f"""
+        <div class="kpi-card">
+            <div class="kpi-title">{title}</div>
+            <div style="display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; align-items: end;">
+                <div><div class="kpi-sub">{label1}</div><div class="kpi-value" style="font-size:1.1em">{fmt_money(val1)}</div></div>
+                <div><div class="kpi-sub">{label2}</div><div class="kpi-value" style="font-size:1.1em; color:#ef4444">{fmt_money(val2)}</div></div>
+                <div><div class="kpi-sub">{label3}</div><div class="kpi-value {color_class}" style="font-size:1.3em">{fmt_money(val3)}</div></div>
+            </div>
+        </div>
+        """
+
+    c_hr, c_sem, c_mes = st.columns(3)
+    
+    with c_hr:
+        st.markdown(kpi_card("Rentabilidad por HORA", ingreso_hr, "Ingreso", costo_hr, "Costo", utilidad_hr, "Utilidad", True), unsafe_allow_html=True)
+    with c_sem:
+        st.markdown(kpi_card("Rentabilidad SEMANAL (Prom)", ingreso_sem, "Ingreso", costo_sem, "Costo", utilidad_sem, "Utilidad", True), unsafe_allow_html=True)
+    with c_mes:
+        st.markdown(kpi_card("Rentabilidad MENSUAL", ingresos_mes, "Ingreso", cost_mensual_sistema, "Costo", utilidad_mes, "Utilidad", True), unsafe_allow_html=True)
+
+    st.write("")
+    
+    # 4. GRÁFICOS
+    c_graph_l, c_graph_r = st.columns([1, 2])
+    with c_graph_l:
+        # Velocímetro Margen
+        fig_gauge = go.Figure(go.Indicator(
+            mode = "gauge+number", value = margen_mes, title = {'text': "Margen % Mes"},
+            gauge = {'axis': {'range': [None, 60]}, 'bar': {'color': "#16a34a"},
+                     'steps': [{'range': [0, 10], 'color': '#fee2e2'}, {'range': [10, 30], 'color': '#fef9c3'}],
+                     'threshold': {'line': {'color': "red", 'width': 4}, 'thickness': 0.75, 'value': 35}}
+        ))
+        fig_gauge.update_layout(height=300, margin=dict(l=20,r=20,t=30,b=20))
+        st.plotly_chart(fig_gauge, use_container_width=True)
+        
+    with c_graph_r:
+        # Cascada
+        fig_water = go.Figure(go.Waterfall(
+            name = "Finanzas", orientation = "v",
+            measure = ["relative", "relative", "relative", "relative", "total"],
+            x = ["Ventas", "Costo Harvester", "Costo Forwarder", "Indirectos", "UTILIDAD"],
+            text = [fmt_money(ingresos_mes), fmt_money(-final_h_mes), fmt_money(-final_f_mes), fmt_money(-tot_ind), fmt_money(utilidad_mes)],
+            y = [ingresos_mes, -tot_h_dir, -tot_f_dir, -tot_ind, utilidad_mes],
+            connector = {"line":{"color":"rgb(63, 63, 63)"}},
+            decreasing = {"marker":{"color":"#ef4444"}}, increasing = {"marker":{"color":"#16a34a"}}, totals = {"marker":{"color":"#15803d"}}
+        ))
+        fig_water.update_layout(title="Estructura de Resultados Mensual", height=300, margin=dict(l=20,r=20,t=40,b=20))
+        st.plotly_chart(fig_water, use_container_width=True)
+
+# --- TAB 2: HARVESTER ---
+with tab_h:
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        h_days = st.number_input("Días/Mes H", value=int(st.session_state.get('h_days', 28)), key="h_days", on_change=save_config)
+        h_hours = st.number_input("Horas/Día H", value=float(st.session_state.get('h_hours', 10.0)), key="h_hours", on_change=save_config)
+        st.info(f"Total: {h_days*h_hours} Horas")
+    with c2:
+        st.subheader("Estructura de Costos")
+        st.session_state['df_harvester'] = st.data_editor(
+            st.session_state['df_harvester'], use_container_width=True, num_rows="dynamic", 
+            column_config={"Valor": st.column_config.NumberColumn(format="$ %d", required=True), "Tipo": st.column_config.SelectboxColumn(options=["$/Mes", "UF/Mes", "Litros/Día", "$/Ev"], required=True)}
+        )
+        save_config()
+
+# --- TAB 3: FORWARDER ---
+with tab_f:
+    c1, c2 = st.columns([1, 3])
+    with c1:
+        f_days = st.number_input("Días/Mes F", value=int(st.session_state.get('f_days', 28)), key="f_days", on_change=save_config)
+        f_hours = st.number_input("Horas/Día F", value=float(st.session_state.get('f_hours', 10.0)), key="f_hours", on_change=save_config)
+        st.info(f"Total: {f_days*f_hours} Horas")
+    with c2:
+        st.subheader("Estructura de Costos")
+        st.session_state['df_forwarder'] = st.data_editor(
+            st.session_state['df_forwarder'], use_container_width=True, num_rows="dynamic", 
+            column_config={"Valor": st.column_config.NumberColumn(format="$ %d", required=True), "Unidad": st.column_config.SelectboxColumn(options=["$/Mes", "Litros/Día"], required=True)}
+        )
+        save_config()
+
+# --- TAB 4: INDIRECTOS ---
+with tab_ind:
+    c_rrhh, c_flota = st.columns(2)
+    with c_rrhh:
+        st.markdown("### 👷 RRHH Indirecto")
+        st.session_state['df_rrhh'] = st.data_editor(st.session_state['df_rrhh'], use_container_width=True, num_rows="dynamic", column_config={"Costo Empresa": st.column_config.NumberColumn(format="$ %d")})
+    with c_flota:
+        st.markdown("### 🛻 Flota y Gastos Generales")
+        st.session_state['df_flota'] = st.data_editor(st.session_state['df_flota'], use_container_width=True, num_rows="dynamic", column_config={"Monto": st.column_config.NumberColumn(format="$ %d")})
+    save_config()
+
+# --- TAB 5: SIMULADOR TARIFAS ---
+with tab_sim:
+    st.header("🎯 Calculadora de Tarifas y Márgenes")
+    
+    col_input1, col_input2, col_input3 = st.columns(3)
+    with col_input1:
+        margin_h = st.slider("Margen Harvester (%)", 0, 60, int(st.session_state.get('target_margin_h', 35)))
+        st.session_state['target_margin_h'] = margin_h
+    with col_input2:
+        margin_f = st.slider("Margen Forwarder (%)", 0, 60, int(st.session_state.get('target_margin_f', 35)))
+        st.session_state['target_margin_f'] = margin_f
+    with col_input3:
+        prod_sim = st.number_input("Prod. Estimada (MR/Hr)", value=22.0, step=0.5)
+        save_config()
+
+    # Cálculos de Costo Unitario
+    cost_h_hr_real = (tot_h_dir + ind_h) / hrs_h if hrs_h > 0 else 0
+    cost_f_hr_real = (tot_f_dir + ind_f) / hrs_f if hrs_f > 0 else 0
+    safe_prod = prod_sim if prod_sim > 0 else 1
+    
+    cost_unit_h = cost_h_hr_real / safe_prod
+    cost_unit_f = cost_f_hr_real / safe_prod
+    cost_unit_sys = cost_unit_h + cost_unit_f
+
+    # Cálculo Tarifas
+    p_h_sim = calc_price(cost_unit_h, margin_h)
+    p_f_sim = calc_price(cost_unit_f, margin_f)
+    profit_h = p_h_sim - cost_unit_h
+    profit_f = p_f_sim - cost_unit_f
+
+    st.divider()
+    st.subheader(f"🎛️ Resultado Simulación Manual")
+    
+    col_d1, col_d2, col_d3 = st.columns(3)
+    with col_d1:
+        st.markdown(f'<div class="highlight-box"><span class="label-text">Harvester</span><br><span class="big-number">{fmt_money(p_h_sim)}</span><br><span class="sub-text">Tarifa Sugerida / MR</span></div>', unsafe_allow_html=True)
+    with col_d2:
+        st.markdown(f'<div class="highlight-box"><span class="label-text">Forwarder</span><br><span class="big-number">{fmt_money(p_f_sim)}</span><br><span class="sub-text">Tarifa Sugerida / MR</span></div>', unsafe_allow_html=True)
+    with col_d3:
+        st.markdown(f'<div class="highlight-box" style="border-left-color: #1d4ed8;"><span class="label-text">TOTAL SISTEMA</span><br><span class="big-number" style="color:#1d4ed8;">{fmt_money(p_h_sim+p_f_sim)}</span><br><span class="sub-text">Tarifa / MR</span></div>', unsafe_allow_html=True)
+
+    # Tabla Detalle
+    st.write("")
+    df_detail = pd.DataFrame({
+        "Concepto": ["Harvester", "Forwarder", "SISTEMA TOTAL"],
+        "Costo Unitario": [fmt_money(cost_unit_h), fmt_money(cost_unit_f), fmt_money(cost_unit_sys)],
+        "Utilidad Unit.": [fmt_money(profit_h), fmt_money(profit_f), fmt_money(profit_h + profit_f)],
+        "Tarifa Final": [fmt_money(p_h_sim), fmt_money(p_f_sim), fmt_money(p_h_sim + p_f_sim)],
+        "Margen %": [f"{margin_h}%", f"{margin_f}%", f"{((profit_h+profit_f)/(p_h_sim+p_f_sim)*100):.1f}%"]
+    })
+    st.dataframe(df_detail, use_container_width=True, hide_index=True)
