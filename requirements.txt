@@ -1,6 +1,2 @@
-streamlit
-pandas
-plotly
-fpdf
-openpyxl
-matplotlib
+streamlit>=1.28
+pandas>=2.0
